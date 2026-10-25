@@ -17,17 +17,16 @@ import requests
 from flask import Flask, request
 from dotenv import load_dotenv
 
+import db
+
 load_dotenv()
 
 app = Flask(__name__)
+db.init_db()
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+14155238886")
-
-# --- Basit, bellek-içi konuşma durumu (demo amaçlı; üretimde bir veritabanı kullanılmalı) ---
-# key: gönderenin WhatsApp numarası, value: { "step": str, "data": dict }
-conversations = {}
 
 STEP_NEW = "NEW"
 STEP_AWAITING_TIME = "AWAITING_TIME"
@@ -35,63 +34,57 @@ STEP_AWAITING_NAME = "AWAITING_NAME"
 STEP_AWAITING_CONFIRM = "AWAITING_CONFIRM"
 
 
-def get_state(sender: str) -> dict:
-    if sender not in conversations:
-        conversations[sender] = {"step": STEP_NEW, "data": {}}
-    return conversations[sender]
-
-
-def reset_state(sender: str) -> None:
-    conversations[sender] = {"step": STEP_NEW, "data": {}}
-
-
 def handle_message(sender: str, message: str) -> str:
-    """Gelen mesaja göre bir sonraki adımı belirler ve gönderilecek yanıt metnini döner."""
+    """Gelen mesaja göre bir sonraki adımı belirler ve gönderilecek yanıt metnini döner.
+    Konuşma durumu her adımda veritabanına yazılır, bellekte tutulmaz (sunucu yeniden
+    başlasa bile kaldığı yerden devam eder)."""
     message = (message or "").strip()
-    state = get_state(sender)
+    state = db.get_state(sender)
     step = state["step"]
+    data = state["data"]
 
     if step == STEP_NEW:
-        state["step"] = STEP_AWAITING_TIME
+        db.save_state(sender, STEP_AWAITING_TIME, data)
         return (
             "Merhaba! Randevu talebiniz için hangi gün ve saat sizin için uygun? "
             "(Örn: Perşembe 14:00)"
         )
 
     if step == STEP_AWAITING_TIME:
-        state["data"]["time"] = message
-        state["step"] = STEP_AWAITING_NAME
+        data["time"] = message
+        db.save_state(sender, STEP_AWAITING_NAME, data)
         return "Teşekkürler. Randevu için adınızı ve soyadınızı alabilir miyim?"
 
     if step == STEP_AWAITING_NAME:
-        state["data"]["name"] = message
-        state["step"] = STEP_AWAITING_CONFIRM
+        data["name"] = message
+        db.save_state(sender, STEP_AWAITING_CONFIRM, data)
         return (
             f"Özet:\n"
-            f"Ad Soyad: {state['data']['name']}\n"
-            f"Talep edilen zaman: {state['data']['time']}\n\n"
+            f"Ad Soyad: {data['name']}\n"
+            f"Talep edilen zaman: {data['time']}\n\n"
             f"Onaylıyor musunuz? (Evet / Hayır)"
         )
 
     if step == STEP_AWAITING_CONFIRM:
         answer = message.lower()
         if answer in ("evet", "e", "yes", "evet.", "onaylıyorum"):
-            # TODO: Google Calendar entegrasyonu burada çağrılacak (2. aşama)
-            name = state["data"].get("name", "")
-            time_text = state["data"].get("time", "")
-            reset_state(sender)
+            # TODO: Google Calendar entegrasyonu burada çağrılacak (sıradaki aşama)
+            name = data.get("name", "")
+            time_text = data.get("time", "")
+            db.save_appointment(sender, name, time_text)
+            db.reset_state(sender)
             return (
                 f"Randevunuz alınmıştır, {name}! ({time_text})\n"
                 f"Herhangi bir değişiklik için bize tekrar yazabilirsiniz."
             )
         elif answer in ("hayır", "h", "no", "hayir"):
-            reset_state(sender)
+            db.reset_state(sender)
             return "Talebiniz iptal edildi. Yeniden randevu almak isterseniz bana yazmanız yeterli."
         else:
             return "Anlayamadım, lütfen 'Evet' ya da 'Hayır' yazın."
 
     # Beklenmeyen durum: sıfırla ve baştan başla
-    reset_state(sender)
+    db.reset_state(sender)
     return handle_message(sender, message)
 
 
@@ -131,6 +124,11 @@ def whatsapp_webhook():
 @app.route("/health", methods=["GET"])
 def health():
     return {"status": "ok"}
+
+
+@app.route("/appointments", methods=["GET"])
+def appointments():
+    return {"appointments": db.list_appointments()}
 
 
 if __name__ == "__main__":
